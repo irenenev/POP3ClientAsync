@@ -1,0 +1,576 @@
+using System;
+using System.Text;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Net.Sockets;
+using System.Collections;
+using System.Net.Security;
+using System.Security.Authentication;
+using System.Text.RegularExpressions;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+
+namespace POP3ClientAsync
+{
+    public class POP3EmailMessage
+    {
+        //номер письма
+        public long msgNumber;
+        //размер письма
+        public long msgSize;
+        //письмо получено?
+        public bool msgReceived;
+        //заголовки письма
+        public string msgHeaders;
+        //тело письма
+        public string msgContent;
+        //заголовок From
+        private string From;
+        //заголовок Subject
+        private string Subject;
+        //заголовок Content-Type в Header
+        private string ContentTypeHeader;
+        //граница фрагментов письма
+        private string Boundary;
+        //вложенная граница фрагментов письма
+        private string SubBoundary;
+        //заголовок Content-Type в Body
+        private string[] ContentTypeBody;
+        //подзаголовок Content-Type в Body
+        private string[] ContentTypeSubBody;
+        //кодировки письма
+        private string[] Charset;
+        //кодировки письма в подфрагментах
+        private string[] CharsetSub;
+        //содержимое заголовков Content-Transfer-Encoding
+        private string[] ContentTransferEncoding;
+        //содержимое подзаголовков Content-Transfer-Encoding
+        private string[] ContentTransferEncodingSub;
+        //фрагменты тела письма, отделенные по boundary
+        private string[] FragmentBody;
+        //подфрагменты тела письма, отделенные по boundary
+        private string[] FragmentSubBody;
+        //фрагменты письма для декодирования
+        private string[] FragmentToReplace;
+        //подфрагменты письма для декодирования
+        private string[] FragmentToReplaceSub;
+        public void ParseMail()
+        {
+            //заголовок From:
+            Regex regFrom = new Regex(@"From:[\s].*[\n\r\t]{0,3}.*?>");
+            Match mFrom = regFrom.Match(msgHeaders);
+            From = mFrom.Value;
+            //cp содержит кодировку, ct содержит B или Q, value содержит строку между знаками ?.....?=, mail содержит емейл в <...>
+            Match mMail = Regex.Match(From, @"\=\?(?<cp>[\w\d\-]+)\?(?<ct>[\w]{1})\?(?<value>[\w\d\=\+]+)\?\=[\s]{0,1}(?<mail>[\w\W\d]+\>{1})", RegexOptions.IgnoreCase);
+            if (mMail.Success)
+                From = "From: " + HeadersEncode(mMail) + mMail.Groups["mail"].Value;
+            msgHeaders = Regex.Replace(msgHeaders, @"From:[\s].*[\n\r\t]{0,3}.*?>", From);
+
+            //заголовок Subject и его подстроки до следующего заголовка:
+            Regex regSub = new Regex(@"Subject:.*(([\r\n]+)^(\s+)(.*)\?\=)+|Subject:.*\?\=", RegexOptions.Multiline);
+            Match mSubj = regSub.Match(msgHeaders);
+            Subject = mSubj.Value;
+            //cp содержит кодировку, ct содержит B или Q, value содержит строку между знаками ?.....?=
+            Regex regSub2 = new Regex(@"\=\?(?<cp>[\w\d\-]+)\?(?<ct>[\w]{1})\?(?<value>[\w\d\/\=\+]+)\?\=", RegexOptions.IgnoreCase);
+            //набор успешных совпадений регулярного выражения со входной строкой
+            MatchCollection mc = regSub2.Matches(Subject);
+            Subject = "Subject: ";
+            foreach (Match m1 in mc)
+                if (m1.Success)
+                    Subject += HeadersEncode(m1);
+            msgHeaders = Regex.Replace(msgHeaders, @"Subject:.*(([\r\n]+)^(\s+)(.*)\?\=)+|Subject:.*\?\=", Subject, RegexOptions.Multiline);
+
+            //заголовок Content-Type in Header
+            Regex regCT = new Regex(@"Content-Type:\s(?<type>[\w\/\-]+)\;");
+            //соответствие регулярному выражению в заголовке
+            Match mCTH = regCT.Match(msgHeaders);
+            ContentTypeHeader = mCTH.Groups["type"].Value;
+
+            //boundary in Content-Type in Header; \x22 - это кавычки; \x5f - это нижнее подчеркивание;
+            Regex regBound = new Regex(@"boundary\=.?([\x22]{0,1})(?<bound>[\d\w\-\+\x5f\=\.\/]+)([\/]{0,1})([\x22]{0,1}?)");
+            Match mBound = regBound.Match(msgHeaders);
+            Boundary = mBound.Groups["bound"].Value;
+            if (!String.IsNullOrEmpty(Boundary))
+            {
+                //список индексов вхождения boundary
+                var indexes = new List<int>();
+                //подстрока --boundary
+                string boundstring = String.Format("--{0}", Boundary);
+                //поиск индекса вхождения substring в строке msgContent, начиная с позиции 0
+                int index = msgContent.IndexOf(boundstring, 0);
+                //если индекс вхождения найден
+                while (index > -1)
+                {
+                    //добавляем индекс вхождения в список индексов
+                    indexes.Add(index);
+                    //ищем следующий индекс вхождения
+                    index = msgContent.IndexOf(boundstring, index + boundstring.Length);
+                }
+                /* 
+                количество фрагментов на 1 меньше найденного количества строк boundary,
+                так как фрагмент начинается и заканчивается строкой boundary:
+                --boundary 1
+                    fragment 1
+                --boundary 2
+                    fragment 2
+                --boundary-- 3 
+                */
+                FragmentBody = new String[indexes.Count - 1];
+                FragmentToReplace = new String[indexes.Count - 1];
+                //заголовки ContentType внутри фрагментов
+                ContentTypeBody = new String[indexes.Count - 1];
+                //заголовки Content-Transfer-Encoding внутри фрагментов
+                ContentTransferEncoding = new String[indexes.Count - 1];
+                //charset in Content-Type
+                Charset = new String[indexes.Count - 1];
+                string newcontent = "";
+                for (int k = 0; k < indexes.Count - 1; k++)
+                {
+                    int len = indexes[k + 1] - indexes[k] - boundstring.Length;
+                    FragmentBody[k] = msgContent.Substring(indexes[k] + boundstring.Length, len).Trim("\n\r".ToCharArray());
+                    //соответствие регулярному выражению внутри фрагментов
+                    Match mCT = regCT.Match(FragmentBody[k]);
+                    ContentTypeBody[k] = mCT.Groups["type"].Value;
+                    //ContentTypeBody[0] = "text/plain";
+                    //ContentTypeBody[1] = "text/html";
+                    Regex regCTE = new Regex(@"Content-Transfer-Encoding:\s(?<type>[\d\w\-]+)");
+                    Match mCTE = regCTE.Match(FragmentBody[k]);
+                    ContentTransferEncoding[k] = mCTE.Groups["type"].Value;
+                    //ContentTransferEncoding[0] = "quoted-printable";
+                    //ContentTransferEncoding[1] = "base64";
+                    Regex regChar = new Regex(@"charset\=([\x22]{0,1})(?<charset>[\d\w\-]+)([\x22]{0,1}?)", RegexOptions.IgnoreCase);
+                    Match mChar = regChar.Match(FragmentBody[k]);
+                    Charset[k] = mChar.Groups["charset"].Value;
+                    //charset[0] = "iso-8859-5";
+                    //charset[1] = "iso-8859-5";
+
+                    //Если составной ContentTypeBody
+                    if (ContentTypeBody[k].Contains("multipart"))
+                    {
+                        //find sub boundary in FragmentBody[k]
+                        Match mSubBound = regBound.Match(FragmentBody[k]);
+                        SubBoundary = mSubBound.Groups["bound"].Value;
+                        if (!String.IsNullOrEmpty(SubBoundary))
+                        {
+                            //список индексов вхождения boundary
+                            var subindexes = new List<int>();
+                            //подстрока --boundary
+                            string boundstring2 = String.Format("--{0}", SubBoundary);
+                            //поиск индекса вхождения boundstring в строке FragmentBody[k], начиная с позиции 0
+                            int subindex = FragmentBody[k].IndexOf(boundstring2, 0);
+                            //индекс до sub boundary
+                            int ind = subindex;
+                            //если индекс вхождения найден
+                            while (subindex > -1)
+                            {
+                                //добавляем индекс вхождения в список индексов
+                                subindexes.Add(subindex);
+                                //ищем следующий индекс вхождения
+                                subindex = FragmentBody[k].IndexOf(boundstring2, subindex + boundstring2.Length);
+                            }
+                            FragmentSubBody = new String[subindexes.Count - 1];
+                            FragmentToReplaceSub = new String[subindexes.Count - 1];
+                            ContentTypeSubBody = new String[subindexes.Count - 1];
+                            ContentTransferEncodingSub = new String[subindexes.Count - 1];
+                            CharsetSub = new String[subindexes.Count - 1];
+                            string newcontent2 = "";
+                            for (int n = 0; n < subindexes.Count - 1; n++)
+                            {
+                                int len2 = subindexes[n + 1] - subindexes[n] - boundstring2.Length;
+                                FragmentSubBody[n] = FragmentBody[k].Substring(subindexes[n] + boundstring2.Length, len2).Trim("\n\r".ToCharArray());
+                                //соответствие регулярному выражению внутри подфрагментов
+                                Match mSubCT = regCT.Match(FragmentSubBody[n]);
+                                ContentTypeSubBody[n] = mSubCT.Groups["type"].Value;
+                                Match mSubCTE = regCTE.Match(FragmentSubBody[n]);
+                                ContentTransferEncodingSub[n] = mSubCTE.Groups["type"].Value;
+                                Match mSubChar = regChar.Match(FragmentSubBody[n]);
+                                CharsetSub[n] = mSubChar.Groups["charset"].Value;
+                                int textPos2 = FragmentSubBody[n].IndexOf("\r\n\r\n");
+                                if (textPos2 != -1)
+                                {
+                                    FragmentToReplaceSub[n] = FragmentSubBody[n].Substring(textPos2 + 4, FragmentSubBody[n].Length - textPos2 - 4);
+                                    if (!String.IsNullOrEmpty(CharsetSub[n]))
+                                        FragmentToReplaceSub[n] = DecodeContent(ContentTransferEncodingSub[n], FragmentToReplaceSub[n], CharsetSub[n]);
+                                    FragmentSubBody[n] = FragmentSubBody[n].Substring(0, textPos2 + 4) + FragmentToReplaceSub[n] + "\r\n";
+                                }
+                                else FragmentSubBody[n] = FragmentSubBody[n] + "\r\n";
+                                newcontent2 = newcontent2 + boundstring2 + "\r\n" + FragmentSubBody[n];
+                            }
+                            //фрагмент до sub boundary + раскодированные подфрагменты
+                            FragmentBody[k] = FragmentBody[k].Substring(0, ind-1) + newcontent2 + boundstring2 + "\r\n";
+                        }
+                    }
+                    //позиция закодированного содержимого внутри фрагмента тела письма
+                    int textPos = FragmentBody[k].IndexOf("\r\n\r\n");
+                    if (textPos != -1)
+                        //закодированный фрагмент тела письма
+                        FragmentToReplace[k] = FragmentBody[k].Substring(textPos + 4, FragmentBody[k].Length - textPos - 4);
+                    else FragmentBody[k] = FragmentBody[k] + "\r\n";
+                    if (!String.IsNullOrEmpty(FragmentToReplace[k]))
+                    {
+                        if (!String.IsNullOrEmpty(Charset[k]))
+                            FragmentToReplace[k] = DecodeContent(ContentTransferEncoding[k], FragmentToReplace[k], Charset[k]);
+                        //Если во вложении файл, картинка, аудио, видео
+                        if (ContentTypeBody[k].Contains("application") || ContentTypeBody[k].Contains("image") || ContentTypeBody[k].Contains("audio") || ContentTypeBody[k].Contains("video"))
+                        {
+                            string Name = "";
+                            //незакодированное имя
+                            Regex regName = new Regex(@"name\=.?([\x22]{0,1})(?<name>[\d\w]+[\.]{1}[\w]+).?([\x22]{0,1})");
+                            Match mName = regName.Match(FragmentBody[k]);
+                            if (mName.Success)
+                                Name = mName.Groups["name"].Value;
+                            //закодированное имя
+                            Match mCodedName = Regex.Match(FragmentBody[k], @"name\=.?([\x22]{0,1})\=\?(?<cp>[\w\d\-]+)\?(?<ct>[\w]{1})\?(?<value>[\w\d\=]+)\?\=", RegexOptions.IgnoreCase);
+                            if (mCodedName.Success)
+                            {
+                                //раскодирование имени вложения
+                                Name = HeadersEncode(mCodedName);
+                                //замена закодированного имени на раскодированное значение
+                                FragmentBody[k] = Regex.Replace(FragmentBody[k], @"name\=.?([\x22]{0,1})\=\?([\w\d\-]+)\?([\w]{1})\?([\w\d\=]+)\?\=", "name=\""+Name);
+                                //после замены textPos сбивается, нужно заново найти его значение
+                                textPos = FragmentBody[k].IndexOf("\r\n\r\n");
+                            }
+                            //убрать лишние символы - пробелы, \r, \n
+                            StringBuilder sbText = new StringBuilder(FragmentToReplace[k], FragmentToReplace[k].Length);
+                            sbText.Replace("\r\n", String.Empty);
+                            sbText.Replace(" ", String.Empty);
+                            FragmentToReplace[k] = sbText.ToString();
+                            Byte[] binaryData = Convert.FromBase64String(FragmentToReplace[k]);
+                            //save image, file, audio, video
+                            try
+                            {
+                                File.WriteAllBytes(Name, binaryData);
+                            }
+                            catch (ArgumentException e)
+                            {
+                                Console.WriteLine(e.ToString());
+                                Console.ReadLine();
+                            }
+                            FragmentToReplace[k] = "Attachment: " + Name + " has been saved in 'POP3ClientAsync' folder";
+                        }
+                        FragmentBody[k] = FragmentBody[k].Substring(0, textPos + 4) + FragmentToReplace[k] + "\r\n";
+                    }
+                    newcontent = newcontent + boundstring + "\r\n" + FragmentBody[k];
+                }
+                msgContent = newcontent + "\r\n" + boundstring;
+            }
+        }
+        // Функция декодирования всех найденных совпадений
+        private string HeadersEncode(Match m)
+        {
+            string result = String.Empty;
+
+            Encoding cp = Encoding.GetEncoding(m.Groups["cp"].Value);
+            if (m.Groups["ct"].Value.ToUpper() == "Q")
+            // кодируем из Quoted-Printable
+                result = ParseQuotedPrintable(m.Groups["value"].Value, m.Groups["cp"].Value);
+            else if (m.Groups["ct"].Value.ToUpper() == "B")
+            // кодируем из Base64
+                result = cp.GetString(Convert.FromBase64String(m.Groups["value"].Value));
+            else
+            // оставляем текст как есть
+                result = m.Groups["value"].Value;
+            return result;
+        }
+
+        // Функция парсинга Quoted-Printable
+        private string ParseQuotedPrintable(string source, string encode)
+        {
+            //удаляет знаки = в конце строк text/html
+            source = Regex.Replace(source, @"(\=)([^\dABCDEF]{2})", "");
+            //заменяет =3D на = в строках text/html
+            source = Regex.Replace(source, @"[\=]{1}[3]{1}[D]{1}", "=");
+            //вызов декодеров
+            if (encode.ToLower() == "iso-8859-5") //Cyrillic (ISO) 
+                return Regex.Replace(source, @"\=(?<char>[\dABCDEF]{2})", QuotedPrintableEncode1bISO);
+            else if (encode.ToLower() == "koi8-r") //Cyrillic koi8
+                return Regex.Replace(source, @"\=(?<char>[\dABCDEF]{2})", QuotedPrintableEncode1bKOI);
+            else if (encode.ToLower() == "utf-8") //Unicode (UTF-8) 
+                return Regex.Replace(source, @"(\=(?<char1>[\dABCDEF]{2})\=(?<char2>[\dABCDEF]{2})){1}", QuotedPrintableEncode2b);
+            else
+                return source;
+
+        }
+        //Функция декодирования Quoted-Printable 1 байтовая
+        private string QuotedPrintableEncode1bISO(Match m)
+        {
+            byte[] bytes = new byte[1];
+            //32-битное представление значения ["char"].Value
+            int iHex = Convert.ToInt32(m.Groups["char"].Value, 16);
+            bytes[0] = Convert.ToByte(iHex);
+            return Encoding.GetEncoding(28595).GetString(bytes); //Cyrillic (ISO) 
+        }
+
+        //Функция декодирования Quoted-Printable 1 байтовая
+        private string QuotedPrintableEncode1bKOI(Match m)
+        {
+            byte[] bytes = new byte[1];
+            //32-битное представление значения ["char"].Value
+            int iHex = Convert.ToInt32(m.Groups["char"].Value, 16);
+            bytes[0] = Convert.ToByte(iHex);
+            return Encoding.GetEncoding(20866).GetString(bytes); //Cyrillic (KOI8-R) 
+        }
+
+        //Функция декодирования Quoted-Printable 2 байтовая
+        private string QuotedPrintableEncode2b(Match m)
+        {
+            byte[] bytes = new byte[2];
+            //32-битное представление значения ["char"].Value
+            int iHex1 = Convert.ToInt32(m.Groups["char1"].Value, 16);
+            int iHex2 = Convert.ToInt32(m.Groups["char2"].Value, 16);
+            bytes[0] = Convert.ToByte(iHex1);
+            bytes[1] = Convert.ToByte(iHex2);
+            return Encoding.GetEncoding(65001).GetString(bytes); //Unicode (UTF-8) 
+        }
+
+        // Функция декодирования содержимого письма
+        private string DecodeContent(string contentTransferEncoding, string source, string encode)
+        {
+            if (contentTransferEncoding == "base64")
+                return Encoding.GetEncoding(encode).GetString(Convert.FromBase64String(source));
+            else if (contentTransferEncoding == "quoted-printable")
+                return ParseQuotedPrintable(source, encode);
+            else //"8bit", "7bit", "binary" 
+                return source; // считаем, что это обычный текст
+        }
+    }
+    public class POP3 : System.Net.Sockets.TcpClient
+    {
+        //сообщение
+        private string Message;
+        //результирующий ответ сервера
+        private string Result;
+        //remote endpoint to establish a socket connection
+        private TcpClient tcpClient = new TcpClient();
+        //SslStream - поток для обмена данными между клиентом и сервером по протоколу безопасности SSL 
+        private SslStream ns = null;
+
+        //Метод соединения с сервером
+        public void ConnectPOP(string ServerName, int Port, string UserName, string Password)
+        {
+
+            tcpClient.Connect(ServerName, Port);
+            ns = new SslStream(tcpClient.GetStream(), false); //false - закрытие внутреннего потока
+            try
+            {
+                ns.AuthenticateAsClient(ServerName);
+            }
+            catch (AuthenticationException e)
+            {
+                Console.WriteLine("Exception: {0}", e.Message);
+                if (e.InnerException != null)
+                {
+                    Console.WriteLine("Inner exception: {0}", e.InnerException.Message);
+                }
+                Console.WriteLine("Аутентификация не удалась");
+                tcpClient.Close();
+            }
+            //Получение ответа
+            Result = Response().Result;
+            //проверка ответа
+            if (Result.Substring(0, 3) != "+OK")
+                throw new POPException(Result);
+            //отправка имени пользователя
+            Message = "USER " + UserName + "\r\n";
+            //Метод Write() отправляет данные через Tcp соединение
+            Write(Message);
+            Result = Response().Result;
+            //проверка ответа
+            if (Result.Substring(0, 3) != "+OK")
+                throw new POPException(Result);
+            //отправка пароля
+            Message = "PASS " + Password + "\r\n";
+            Write(Message);
+            Result = Response().Result;
+            //проверка ответа
+            if (Result.Substring(0, 3) != "+OK")
+                throw new POPException(Result);
+        }
+
+        //Метод получения ответа сервера
+        private async Task<string> Response()
+        {
+            //кодировка UTF8
+            UTF8Encoding EncodedData = new UTF8Encoding();
+            //буфер ответа сервера размером 2^10
+            byte[] ServerBuffer = new Byte[1024];
+            //количество байт ответа сервера
+            int count = 0;
+            //считывание данных из сетевого потока в буфер
+            while (true)
+            {
+                byte[] buff = new Byte[2];
+                //считываем из сетевого потока 1 байт, записываем в buff
+                int bytes = await ns.ReadAsync(buff, 0, 1);
+                if (bytes == 1) // если удалось получить 1 байт
+                {
+                    ServerBuffer[count] = buff[0];
+                    count++;
+                    if (buff[0] == '\n') break; //конец строки
+                }
+                else break; //нет данныхдля чтения
+            }
+            //декодирование из массива байт в UTF8-строку
+            string ReturnValue = EncodedData.GetString(ServerBuffer, 0, count);
+            return ReturnValue;
+        }
+
+        //Метод отправляет данные через Tcp соединение
+        private void Write(string Message)
+        {
+            //кодировка UTF8
+            UTF8Encoding EncodedData = new UTF8Encoding();
+            //буфер для отправки на сервер размером 2^10
+            byte[] WriteBuffer = new Byte[1024];
+            //помещение кодированного сообщения в буфер
+            WriteBuffer = EncodedData.GetBytes(Message);
+            //вывод содержимого буфера в поток Tcp
+            ns.Write(WriteBuffer, 0, WriteBuffer.Length);
+        }
+
+        //Метод получения конкретного сообщения
+        public POP3EmailMessage RetrieveMessage(POP3EmailMessage msg)
+        {
+            POP3EmailMessage MailMessage = new POP3EmailMessage();
+            //объект StringBuilder для сохранения нескольких строк ответа
+            StringBuilder ResponseStr = new StringBuilder();
+            MailMessage.msgSize = msg.msgSize;
+            MailMessage.msgNumber = msg.msgNumber;
+            //команда RETR для получения сообщения
+            Message = "RETR " + msg.msgNumber + "\r\n";
+            Write(Message);
+            Result = Response().Result;
+            //проверка ответа
+            if (Result.Substring(0, 3) != "+OK")
+                throw new POPException(Result);
+            ResponseStr.Append(Result);
+            //сообщение получено, установка флага прочтения в true
+            MailMessage.msgReceived = true;
+            //получение тела сообщения, пока не встретится конец "."
+            while (true)
+            {
+                Result = Response().Result;
+                if (Result == ".\r\n") break;
+                ResponseStr.Append(Result);
+            }
+            //строка ответа содержит всё сообщение
+            Result = ResponseStr.ToString();
+            //поиск позиции конца заголовка
+            int headerPos = Result.IndexOf("\r\n\r\n");
+            // Если хвост не найден, значит в теле сообщения только заголовки
+            if (headerPos == -1)
+                MailMessage.msgHeaders = Result;
+            // Если хвост найден, отделяем заголовки
+            else
+            {
+                MailMessage.msgHeaders = Result.Substring(0, headerPos);
+                MailMessage.msgContent = Result.Substring(headerPos + 4, Result.Length - headerPos - 4);
+            }
+            //parse
+            MailMessage.ParseMail();
+            return MailMessage;
+        }
+
+        //Метод получения списка сообщений
+        public ArrayList ListMessages()
+        {
+            ArrayList returnArray = new ArrayList();
+            Message = "LIST\r\n";
+            Write(Message);
+            Result = Response().Result;
+            //Console.WriteLine("LIST " + Result);
+            //проверка ответа
+            if (Result.Substring(0, 3) != "+OK")
+                throw new POPException(Result);
+            while (true)
+            {
+                Result = Response().Result;
+                if (Result == ".\r\n") return returnArray;
+                else
+                {
+                    POP3EmailMessage MailMessage = new POP3EmailMessage();
+                    //определение разделителя
+                    char[] separator = { ' ' };
+                    //разбиение массива данных
+                    string[] values = Result.Split(separator);
+                    //помещение данных в объект MailMessage
+                    MailMessage.msgNumber = Int32.Parse(values[0]);
+                    MailMessage.msgSize = Int32.Parse(values[1]);
+                    MailMessage.msgReceived = false;
+                    returnArray.Add(MailMessage);
+                    continue;
+                }
+            }
+        }
+
+        //Метод удаления сообщения
+        public void DeleteMessage(POP3EmailMessage msg)
+        {
+            Message = "DELE " + msg.msgNumber + "\r\n";
+            Write(Message);
+            Result = Response().Result;
+            //проверка ответа
+            if (Result.Substring(0, 3) != "+OK")
+                throw new POPException(Result);
+        }
+
+        //Метод отсоединения от сервера
+        public void DisconnectPOP()
+        {
+            Message = "QUIT\r\n";
+            Write(Message);
+            Result = Response().Result;
+            //проверка ответа
+            if (Result.Substring(0, 3) != "+OK")
+                throw new POPException(Result);
+            ns.Close();
+        }
+    }
+    public class POPException : System.ApplicationException
+    {
+        public POPException(string str) : base(str)
+        { }
+    }
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            try
+            {
+                POP3 popMail = new POP3();
+                popMail.ConnectPOP("pop.gmail.com", 995, "IreneListik", "874jkBo78C");
+                /*
+                //если нужно получить конкретное письмо по номеру
+                POP3EmailMessage msg = new POP3EmailMessage();
+                msg.msgNumber = 8;
+                POP3EmailMessage POPMsgContent = popMail.RetrieveMessage(msg);
+                Console.WriteLine(POPMsgContent.msgHeaders);
+                Console.WriteLine(POPMsgContent.msgContent);
+                */
+                
+                ArrayList MessageList = popMail.ListMessages();
+                foreach (POP3EmailMessage msg in MessageList)
+                {
+                    POP3EmailMessage POPMsgContent = popMail.RetrieveMessage(msg);
+                    Console.WriteLine("Message {0}:{1}", POPMsgContent.msgNumber, POPMsgContent.msgSize);
+                    Console.WriteLine(POPMsgContent.msgHeaders);
+                    Console.WriteLine(POPMsgContent.msgContent);
+                }
+                
+                popMail.DisconnectPOP();
+                Console.ReadLine();
+            }
+            catch (POPException e)
+            {
+                Console.WriteLine(e.ToString());
+                Console.ReadLine();
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine(e.ToString());
+                Console.ReadLine();
+            }
+        }
+    }
+}
