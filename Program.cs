@@ -19,27 +19,46 @@ namespace POP3ClientAsync
                 Console.WriteLine("Enter password");
                 string password = Console.ReadLine();
                 popMail.ConnectPOP(server, port, user, password);
-                /*
-                //если нужно получить конкретное письмо по номеру
-                POP3EmailMessage msg = new POP3EmailMessage();
-                msg.msgNumber = 8;
-                POP3EmailMessage POPMsgContent = popMail.RetrieveMessage(msg);
-                Console.WriteLine(POPMsgContent.msgHeaders);
-                Console.WriteLine(POPMsgContent.msgContent);
-                */
-                
-                //получение всех писем
-                ArrayList MessageList = popMail.ListMessages();
-                foreach (POP3EmailMessage msg in MessageList)
+                int Number = popMail.StatMessages();
+                Console.WriteLine("Your mailbox has this number of messages: " + Number);
+                Console.WriteLine(" Receive all messages-<A>\n Receive one message by number-<N>\n");
+                ConsoleKeyInfo cki = Console.ReadKey(true);
+                POP3EmailMessage msg, POPMsgContent;
+                ArrayList MessageList;
+                switch (cki.Key.ToString())
                 {
-                    POP3EmailMessage POPMsgContent = popMail.RetrieveMessage(msg);
-                    Console.WriteLine("Message {0}:{1}", POPMsgContent.msgNumber, POPMsgContent.msgSize);
-                    Console.WriteLine(POPMsgContent.msgHeaders);
-                    Console.WriteLine(POPMsgContent.msgContent);
+                    case "A":
+                        //получение всех писем
+                        MessageList = popMail.ListMessages();
+                        foreach (POP3EmailMessage msge in MessageList)
+                        {
+                            POPMsgContent = popMail.RetrieveMessage(msge);
+                            Console.WriteLine("Message {0}:{1}", POPMsgContent.msgNumber, POPMsgContent.msgSize);
+                            Console.WriteLine(POPMsgContent.msgHeaders);
+                            Console.WriteLine(POPMsgContent.msgContent);
+                        }
+                        break;
+                    case "N":
+                        Console.WriteLine("Enter number of message");
+                        int msgNum = Int32.Parse(Console.ReadLine());
+                        if (msgNum > Number || msgNum <= 0)
+                        {
+                            Console.WriteLine("Wrong number");
+                            break;
+                        }
+                        //если нужно получить конкретное письмо по номеру
+                        msg = new POP3EmailMessage();
+                        msg.msgNumber = msgNum;
+                        POPMsgContent = popMail.RetrieveMessage(msg);
+                        Console.WriteLine(POPMsgContent.msgHeaders);
+                        Console.WriteLine(POPMsgContent.msgContent);
+                        break;
+                    default:
+                        Console.WriteLine("You entered wrong letter. Try again");
+                        break;
                 }
-                
                 popMail.DisconnectPOP();
-                Console.WriteLine("Messages have been received. Close the program");
+                Console.WriteLine("Close the program");
                 Console.ReadLine();
             }
             catch (POPException e)

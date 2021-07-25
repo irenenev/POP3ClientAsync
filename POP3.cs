@@ -145,6 +145,22 @@ namespace POP3ClientAsync
             return MailMessage;
         }
 
+        //Метод получения статистики о кол-ве сообщений
+        public int StatMessages()
+        {
+            Message = "STAT\r\n";
+            Write(Message);
+            Result = Response().Result;
+            //проверка ответа
+            if (Result.Substring(0, 3) != "+OK")
+                throw new POPException(Result);
+            //определение разделителя
+            char[] separator = { ' ' };
+            //разбиение массива данных
+            string[] values = Result.Split(separator);
+            return Int32.Parse(values[1]);
+        }
+
         //Метод получения списка сообщений
         public ArrayList ListMessages()
         {
@@ -152,7 +168,6 @@ namespace POP3ClientAsync
             Message = "LIST\r\n";
             Write(Message);
             Result = Response().Result;
-            //Console.WriteLine("LIST " + Result);
             //проверка ответа
             if (Result.Substring(0, 3) != "+OK")
                 throw new POPException(Result);
